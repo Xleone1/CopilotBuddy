@@ -35,6 +35,7 @@ namespace Styx.Helpers
         private bool _logoutInactivityUseForceQuit = false;
         private bool _profileDebuggingMode = false;
         private bool _useFrameLock = false;
+        private bool _unhookEndSceneWhenIdle = false;
 
         /// <summary>
         /// <summary>
@@ -157,6 +158,19 @@ namespace Styx.Helpers
         {
             get { return _useFrameLock; }
             set { _useFrameLock = value; }
+        }
+
+        /// <summary>
+        /// Remove the EndScene hook patch from d3d9 while the bot is idle and re-install it
+        /// before the next execution. Shrinks the wall-clock window in which the patch is
+        /// visible to server-side memory scans. See GreenMagic.ExecutorRand.IdleUnhookEnabled.
+        /// </summary>
+        [Setting(Explanation = "Remove the EndScene hook while the bot is idle. Shrinks the window an anti-cheat memory scan can see the patch.")]
+        [DefaultValue(false)]
+        public bool UnhookEndSceneWhenIdle
+        {
+            get { return _unhookEndSceneWhenIdle; }
+            set { _unhookEndSceneWhenIdle = value; }
         }
 
         private LogLevel _loggingLevel = LogLevel.Normal;

@@ -70,7 +70,18 @@ namespace GreenMagic
         private bool m_FirstExecution;
         private byte[] m_ClearBytes;
         private byte[]? m_OriginalEndSceneBytes;
-        private bool m_Disposed;
+        private volatile bool m_Disposed;
+
+        // Idle un-hook state (see #region Idle Un-hook)
+        private byte[]? m_PatchBytes;              // exact bytes of the EndScene patch we installed (5 or 7)
+        private int m_PatchLength;                 // bytes overwritten at m_OrigEndScene (5 = E9 rel32, 7 = DXVK B8+FF E0)
+        private bool m_IsDxvkPatch;                // patch is the 7-byte absolute JMP required by the DXVK prologue
+        private bool m_HookInstalled;              // our patch is currently present at m_OrigEndScene
+        private long m_LastExecuteUtcTicks = DateTime.UtcNow.Ticks;
+        private long m_NextIdleUnhookAttemptTicks;
+        private bool m_IdleUnhookWarned;
+        private readonly object m_HookStateLock = new object();
+        private System.Threading.Timer? m_IdleTimer;
 
         public bool IsOpen => Memory != null && Memory.IsProcessOpen && Memory.IsThreadOpen;
         public bool IsInitialized { get; private set; }
@@ -108,6 +119,32 @@ namespace GreenMagic
         /// Last VEH status code (0=OK, 1=TlsAlloc fail, 2=AddVEH fail, 3=TlsSetValue fail, 4=exception).
         /// </summary>
         public int LastStatus => Memory.Read<int>(new uint[] { m_StatusPtr });
+
+        /// <summary>
+        /// When true, the EndScene patch is written back to the original prologue once the
+        /// executor has been idle for <see cref="IdleUnhookDelayMs"/>, and re-installed on the
+        /// next Execute()/BeginExecute(). This shrinks the wall-clock window in which the
+        /// 5/7-byte patch is visible to server-side Warden memory scans (Warden re-arms
+        /// modules mid-session). Continuous (frame-lock) execution never un-hooks.
+        /// Persisted as StyxSettings.UnhookEndSceneWhenIdle — default false, so behavior is
+        /// unchanged unless the setting is turned on.
+        /// </summary>
+        public static bool IdleUnhookEnabled
+        {
+            get { return Styx.Helpers.StyxSettings.Instance.UnhookEndSceneWhenIdle; }
+            set { Styx.Helpers.StyxSettings.Instance.UnhookEndSceneWhenIdle = value; }
+        }
+
+        /// <summary>
+        /// Inactivity in milliseconds before the EndScene patch is removed while idle.
+        /// </summary>
+        public static int IdleUnhookDelayMs { get; set; } = 10000;
+
+        /// <summary>
+        /// True when our patch is currently written at the EndScene hook site. False while
+        /// idle un-hook has the original prologue bytes restored.
+        /// </summary>
+        public bool IsHookAttached => m_HookInstalled;
 
         public ExecutorRand(Memory memory, uint endSceneAddress)
         {
@@ -178,8 +215,24 @@ namespace GreenMagic
             }
 
             InitializeDetour();
+
+            // Snapshot the patch we just installed so idle un-hook can put it back later.
+            m_PatchLength = m_IsDxvkPatch ? 7 : 5;
+            m_PatchBytes = Memory.ReadBytes(m_OrigEndScene, m_PatchLength);
+            if (m_PatchBytes == null || m_PatchBytes.Length != m_PatchLength)
+            {
+                m_PatchBytes = BuildInstalledPatchBytes();
+                Debug.WriteLine("[ExecutorRand] WARNING: could not read back installed EndScene patch — using reconstructed bytes.");
+            }
+            m_HookInstalled = true;
+            Debug.WriteLine($"[ExecutorRand] Patch site snapshot: {BitConverter.ToString(m_PatchBytes)} ({m_PatchLength} bytes)");
+
             Clear();
             IsInitialized = true;
+
+            m_LastExecuteUtcTicks = DateTime.UtcNow.Ticks;
+            // Cheap guard inside the tick: returns immediately while IdleUnhookEnabled is false.
+            m_IdleTimer = new System.Threading.Timer(IdleUnhookTick, null, 1000, 1000);
         }
 
         public ExecutorRand(int processId, uint endSceneAddress)
@@ -193,11 +246,19 @@ namespace GreenMagic
         {
             lock (thisLock)
             {
+                if (IdleUnhookEnabled)
+                {
+                    MarkExecuted();
+                    if (!EnsureAttached())
+                        throw new InjectionDesyncException("EndScene hook could not be re-attached (idle un-hook active)");
+                }
+
                 if (m_ContinuousExecution)
                     EndExecute();
 
                 m_ContinuousExecution = true;
                 m_FirstExecution = true;
+                MarkExecuted();
             }
         }
 
@@ -207,6 +268,7 @@ namespace GreenMagic
             {
                 m_ContinuousExecution = false;
                 m_FirstExecution = false;
+                MarkExecuted();
                 // HB 6.2.3/Legion: only signal Continue if the hook is currently
                 // waiting inside @CheckInjection, otherwise Set() would pre-signal
                 // the AutoReset event and desync the next frame.
@@ -224,6 +286,15 @@ namespace GreenMagic
         {
             if (!IsOpen || !IsInitialized)
                 throw new Exception("Cannot execute code while process is not opened and/or Executor is not initialized.");
+
+            // Idle un-hook may have removed our patch; put it back before injecting.
+            if (IdleUnhookEnabled)
+            {
+                MarkExecuted();
+                if (!EnsureAttached())
+                    throw new InjectionDesyncException("EndScene hook could not be re-attached (idle un-hook active)");
+            }
+
             lock (thisLock)
             {
                 Memory.Asm!.Inject(m_InjectedCode);
@@ -264,6 +335,8 @@ namespace GreenMagic
             }
 
             Memory.WriteBytes(m_InjectedCode, m_ClearBytes);
+
+            MarkExecuted();
         }
 
         public void GrabFrame()
@@ -911,15 +984,15 @@ namespace GreenMagic
             // Cleanest x86 7-byte absolute JMP: B8 imm32 (mov eax, addr) + FF E0 (jmp eax) = 7 bytes,
             // but clobbers eax. Since we're at the very start of EndScene and eax is caller-saved this is fine.
             Clear();
-            bool isDxvkPrologue = m_OriginalEndSceneBytes != null &&
-                                  m_OriginalEndSceneBytes.Length >= 7 &&
-                                  m_OriginalEndSceneBytes[0] == 0x8D &&
-                                  m_OriginalEndSceneBytes[1] == 0x4C &&
-                                  m_OriginalEndSceneBytes[2] == 0x24 &&
-                                  // [3] = esp offset: 0x04 or 0x08 depending on DXVK version
-                                  m_OriginalEndSceneBytes[4] == 0x83 &&
-                                  m_OriginalEndSceneBytes[5] == 0xE4;
-            if (isDxvkPrologue)
+            m_IsDxvkPatch = m_OriginalEndSceneBytes != null &&
+                            m_OriginalEndSceneBytes.Length >= 7 &&
+                            m_OriginalEndSceneBytes[0] == 0x8D &&
+                            m_OriginalEndSceneBytes[1] == 0x4C &&
+                            m_OriginalEndSceneBytes[2] == 0x24 &&
+                            // [3] = esp offset: 0x04 or 0x08 depending on DXVK version
+                            m_OriginalEndSceneBytes[4] == 0x83 &&
+                            m_OriginalEndSceneBytes[5] == 0xE4;
+            if (m_IsDxvkPatch)
             {
                 // 7-byte absolute JMP: mov eax, imm32 + jmp eax
                 // B8 [4 bytes addr] FF E0  = 7 bytes, covers lea ecx (4) + and esp (3) cleanly
@@ -1062,6 +1135,243 @@ namespace GreenMagic
 
         #endregion
 
+        #region Idle Un-hook
+
+        private void MarkExecuted()
+        {
+            // DateTime is not atomically readable on x86 — keep ticks in a long and use Interlocked.
+            Interlocked.Exchange(ref m_LastExecuteUtcTicks, DateTime.UtcNow.Ticks);
+            m_IdleUnhookWarned = false;
+        }
+
+        private TimeSpan IdleTime => TimeSpan.FromTicks(DateTime.UtcNow.Ticks - Interlocked.Read(ref m_LastExecuteUtcTicks));
+
+        /// <summary>
+        /// Reconstructs the 5/7-byte patch exactly as InjectDetour emits it. Only used if the
+        /// read-back of the freshly installed patch failed.
+        /// </summary>
+        private byte[] BuildInstalledPatchBytes()
+        {
+            if (m_IsDxvkPatch)
+            {
+                // mov eax, imm32 ; jmp eax  (B8 xx xx xx xx FF E0)
+                byte[] patch = new byte[7];
+                patch[0] = 0xB8;
+                BitConverter.GetBytes(m_EndSceneDetour).CopyTo(patch, 1);
+                patch[5] = 0xFF;
+                patch[6] = 0xE0;
+                return patch;
+            }
+            else
+            {
+                // jmp rel32  (E9 xx xx xx xx)
+                byte[] patch = new byte[5];
+                patch[0] = 0xE9;
+                BitConverter.GetBytes(unchecked((int)(m_EndSceneDetour - (m_OrigEndScene + 5)))).CopyTo(patch, 1);
+                return patch;
+            }
+        }
+
+        private static byte[]? SubArray(byte[]? source, int count)
+        {
+            if (source == null || count <= 0 || source.Length < count)
+                return null;
+            if (source.Length == count)
+                return source;
+            byte[] result = new byte[count];
+            Array.Copy(source, result, count);
+            return result;
+        }
+
+        private static bool BytesEqual(byte[]? a, byte[]? b)
+        {
+            if (a == null || b == null || a.Length != b.Length)
+                return false;
+            for (int i = 0; i < a.Length; i++)
+            {
+                if (a[i] != b[i])
+                    return false;
+            }
+            return true;
+        }
+
+        /// <summary>
+        /// Timer callback. Cheap no-op unless idle un-hook is enabled and the executor has been
+        /// idle for IdleUnhookDelayMs. Never throws.
+        /// </summary>
+        private void IdleUnhookTick(object? state)
+        {
+            try
+            {
+                if (m_Disposed || !IdleUnhookEnabled)
+                    return;
+                // Continuous (frame-lock) execution must never run unhooked.
+                if (m_ContinuousExecution || !IsOpen)
+                    return;
+                if (!m_HookInstalled)
+                    return;
+                if (IdleTime.TotalMilliseconds < IdleUnhookDelayMs)
+                    return;
+                if (DateTime.UtcNow.Ticks < Interlocked.Read(ref m_NextIdleUnhookAttemptTicks))
+                    return;
+
+                DetachHook();
+            }
+            catch
+            {
+                // A timer callback must never take down the bot.
+            }
+        }
+
+        /// <summary>
+        /// Restores the original EndScene prologue so the patch is not resident in d3d9 while idle.
+        /// Only writes when the detour is not executing (InHook == 0) and verifies by read-back.
+        /// </summary>
+        private void DetachHook()
+        {
+            lock (m_HookStateLock)
+            {
+                if (m_Disposed || !m_HookInstalled || m_PatchBytes == null)
+                    return;
+
+                byte[]? original = SubArray(m_OriginalEndSceneBytes, m_PatchLength);
+                if (original == null)
+                {
+                    Interlocked.Exchange(ref m_NextIdleUnhookAttemptTicks, DateTime.UtcNow.AddSeconds(60).Ticks);
+                    if (!m_IdleUnhookWarned)
+                    {
+                        m_IdleUnhookWarned = true;
+                        Debug.WriteLine("[ExecutorRand] WARNING: idle un-hook skipped — original EndScene bytes unavailable.");
+                    }
+                    return;
+                }
+
+                for (int attempt = 0; attempt < 3; attempt++)
+                {
+                    if (m_Disposed)
+                        return;
+                    // Activity may have resumed between the tick and here — keep the hook.
+                    if (IdleTime.TotalMilliseconds < IdleUnhookDelayMs)
+                        return;
+
+                    if (InHook)
+                    {
+                        Thread.Sleep(15);
+                        continue;
+                    }
+
+                    // Never clobber a hook that someone else installed over ours.
+                    byte[]? before = Memory.ReadBytes(m_OrigEndScene, m_PatchLength);
+                    if (!BytesEqual(before, m_PatchBytes))
+                    {
+                        Interlocked.Exchange(ref m_NextIdleUnhookAttemptTicks, DateTime.UtcNow.AddSeconds(60).Ticks);
+                        if (!m_IdleUnhookWarned)
+                        {
+                            m_IdleUnhookWarned = true;
+                            Debug.WriteLine("[ExecutorRand] WARNING: idle un-hook skipped — EndScene no longer holds our patch.");
+                        }
+                        return;
+                    }
+
+                    Memory.WriteBytes(m_OrigEndScene, original);
+
+                    byte[]? verify = Memory.ReadBytes(m_OrigEndScene, m_PatchLength);
+                    if (BytesEqual(verify, original))
+                    {
+                        m_HookInstalled = false;
+                        m_IdleUnhookWarned = false;
+                        Interlocked.Exchange(ref m_NextIdleUnhookAttemptTicks, 0);
+                        Debug.WriteLine("[ExecutorRand] EndScene un-hooked (idle) — patch site restored");
+                        return;
+                    }
+                }
+
+                // Could not verify: make sure our patch is back so the hook stays consistent.
+                try
+                {
+                    byte[]? current = Memory.ReadBytes(m_OrigEndScene, m_PatchLength);
+                    if (!BytesEqual(current, m_PatchBytes))
+                        Memory.WriteBytes(m_OrigEndScene, m_PatchBytes);
+                }
+                catch
+                {
+                }
+                // Back off — retrying every second would add write traffic of its own.
+                Interlocked.Exchange(ref m_NextIdleUnhookAttemptTicks, DateTime.UtcNow.AddSeconds(60).Ticks);
+                if (!m_IdleUnhookWarned)
+                {
+                    m_IdleUnhookWarned = true;
+                    Debug.WriteLine("[ExecutorRand] WARNING: idle un-hook failed this cycle — EndScene hook left installed (retrying in 60s).");
+                }
+            }
+        }
+
+        /// <summary>
+        /// Re-installs the patch if idle un-hook removed it. Returns false if the hook could not
+        /// be verified back in place — the caller must then not inject.
+        /// </summary>
+        private bool EnsureAttached()
+        {
+            if (m_HookInstalled)
+                return true;
+
+            lock (m_HookStateLock)
+            {
+                if (m_HookInstalled)
+                    return true;
+
+                if (m_Disposed || !IsOpen || m_PatchBytes == null)
+                {
+                    Debug.WriteLine("[ExecutorRand] WARNING: cannot re-attach EndScene hook (disposed, process closed, or patch bytes missing).");
+                    return false;
+                }
+
+                try
+                {
+                    byte[]? original = SubArray(m_OriginalEndSceneBytes, m_PatchLength);
+                    for (int attempt = 0; attempt < 15; attempt++)
+                    {
+                        if (m_Disposed)
+                            return false;
+
+                        if (!InHook)
+                        {
+                            // Only write over our own bytes or the untouched original —
+                            // never clobber a hook another tool installed while we were detached.
+                            byte[]? before = Memory.ReadBytes(m_OrigEndScene, m_PatchLength);
+                            if (!BytesEqual(before, m_PatchBytes) && !BytesEqual(before, original))
+                            {
+                                Debug.WriteLine("[ExecutorRand] WARNING: EndScene holds a foreign hook — refusing to overwrite it.");
+                                return false;
+                            }
+
+                            Memory.WriteBytes(m_OrigEndScene, m_PatchBytes);
+
+                            byte[]? verify = Memory.ReadBytes(m_OrigEndScene, m_PatchLength);
+                            if (BytesEqual(verify, m_PatchBytes))
+                            {
+                                m_HookInstalled = true;
+                                Debug.WriteLine("[ExecutorRand] EndScene hook re-attached");
+                                return true;
+                            }
+                        }
+
+                        Thread.Sleep(10);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Debug.WriteLine($"[ExecutorRand] WARNING: EndScene hook re-attach failed: {ex.Message}");
+                    return false;
+                }
+
+                Debug.WriteLine("[ExecutorRand] WARNING: EndScene hook could not be re-attached — patch site never verified.");
+                return false;
+            }
+        }
+
+        #endregion
+
         #region Cleanup
 
         ~ExecutorRand()
@@ -1077,57 +1387,72 @@ namespace GreenMagic
             m_Disposed = true;
             IsInitialized = false;
 
+            // Stop the idle un-hook timer before touching the target process. A tick already
+            // in flight re-checks m_Disposed before every write (see DetachHook).
+            try { m_IdleTimer?.Dispose(); } catch { }
+            m_IdleTimer = null;
+
             try
             {
                 if (Memory != null && m_OriginalEndSceneBytes != null)
                 {
-                    // Signal one more frame to trigger TearDownGate in the target
-                    // Write a bare RET to injected code so it does nothing
-                    Memory.Write<byte>(m_InjectedCode, 195); // 0xC3 = retn
-                    try
+                    if (m_HookInstalled)
                     {
-                        m_InjectionWaitingEvent.Set();
-                        m_InjectionFinishedEvent.WaitOne(5000, false);
-                        m_InjectionWaitingEvent.Reset();
-                        m_InjectionContinueEvent.Set();
-                    }
-                    catch { }
+                        // Signal one more frame to trigger TearDownGate in the target
+                        // Write a bare RET to injected code so it does nothing
+                        Memory.Write<byte>(m_InjectedCode, 195); // 0xC3 = retn
+                        try
+                        {
+                            m_InjectionWaitingEvent.Set();
+                            m_InjectionFinishedEvent.WaitOne(5000, false);
+                            m_InjectionWaitingEvent.Reset();
+                            m_InjectionContinueEvent.Set();
+                        }
+                        catch { }
 
-                    // Verify that EndScene still has our JMP before restoring
-                    // (another hook may have overwritten it since we installed ours)
-                    byte[]? currentBytes = Memory.ReadBytes(m_OrigEndScene, 7);
-                    bool hookIsOurs = false;
+                        // Verify that EndScene still has our JMP before restoring
+                        // (another hook may have overwritten it since we installed ours)
+                        byte[]? currentBytes = Memory.ReadBytes(m_OrigEndScene, 7);
+                        bool hookIsOurs = false;
 
-                    if (currentBytes != null && currentBytes.Length >= 5 && currentBytes[0] == 0xE9)
-                    {
-                        // Standard 5-byte relative JMP
-                        int expectedRel = (int)(m_EndSceneDetour - (m_OrigEndScene + 5));
-                        int actualRel = BitConverter.ToInt32(currentBytes, 1);
-                        hookIsOurs = (expectedRel == actualRel);
-                        if (!hookIsOurs)
-                            Debug.WriteLine($"[ExecutorRand] WARNING: JMP target mismatch (expected rel=0x{expectedRel:X8}, actual=0x{actualRel:X8}).");
-                    }
-                    else if (currentBytes != null && currentBytes.Length >= 7 && currentBytes[0] == 0xB8)
-                    {
-                        // 7-byte DXVK absolute JMP: mov eax, imm32 + jmp eax
-                        uint actualTarget = BitConverter.ToUInt32(currentBytes, 1);
-                        hookIsOurs = (actualTarget == m_EndSceneDetour);
-                        if (!hookIsOurs)
-                            Debug.WriteLine($"[ExecutorRand] WARNING: DXVK JMP target mismatch (expected=0x{m_EndSceneDetour:X8}, actual=0x{actualTarget:X8}).");
+                        if (currentBytes != null && currentBytes.Length >= 5 && currentBytes[0] == 0xE9)
+                        {
+                            // Standard 5-byte relative JMP
+                            int expectedRel = (int)(m_EndSceneDetour - (m_OrigEndScene + 5));
+                            int actualRel = BitConverter.ToInt32(currentBytes, 1);
+                            hookIsOurs = (expectedRel == actualRel);
+                            if (!hookIsOurs)
+                                Debug.WriteLine($"[ExecutorRand] WARNING: JMP target mismatch (expected rel=0x{expectedRel:X8}, actual=0x{actualRel:X8}).");
+                        }
+                        else if (currentBytes != null && currentBytes.Length >= 7 && currentBytes[0] == 0xB8)
+                        {
+                            // 7-byte DXVK absolute JMP: mov eax, imm32 + jmp eax
+                            uint actualTarget = BitConverter.ToUInt32(currentBytes, 1);
+                            hookIsOurs = (actualTarget == m_EndSceneDetour);
+                            if (!hookIsOurs)
+                                Debug.WriteLine($"[ExecutorRand] WARNING: DXVK JMP target mismatch (expected=0x{m_EndSceneDetour:X8}, actual=0x{actualTarget:X8}).");
+                        }
+                        else
+                        {
+                            Debug.WriteLine($"[ExecutorRand] WARNING: EndScene first byte is not E9 or B8. Not restoring.");
+                        }
+
+                        if (hookIsOurs)
+                        {
+                            Memory.WriteBytes(m_OrigEndScene, m_OriginalEndSceneBytes);
+                            m_HookInstalled = false;
+                            Debug.WriteLine($"[ExecutorRand] Restored original EndScene bytes at 0x{m_OrigEndScene:X8}");
+                        }
+                        else
+                        {
+                            Debug.WriteLine($"[ExecutorRand] WARNING: Not restoring — another hook may be installed.");
+                        }
                     }
                     else
                     {
-                        Debug.WriteLine($"[ExecutorRand] WARNING: EndScene first byte is not E9 or B8. Not restoring.");
-                    }
-
-                    if (hookIsOurs)
-                    {
-                        Memory.WriteBytes(m_OrigEndScene, m_OriginalEndSceneBytes);
-                        Debug.WriteLine($"[ExecutorRand] Restored original EndScene bytes at 0x{m_OrigEndScene:X8}");
-                    }
-                    else
-                    {
-                        Debug.WriteLine($"[ExecutorRand] WARNING: Not restoring — another hook may be installed.");
+                        // Idle un-hook already wrote the original prologue back, so there is
+                        // nothing to restore and no frame will ever run the detour again.
+                        Debug.WriteLine("[ExecutorRand] Dispose: EndScene is un-hooked (idle) — original bytes already in place.");
                     }
 
                     // Clear injected code
