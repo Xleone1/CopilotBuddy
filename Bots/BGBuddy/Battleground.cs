@@ -31,6 +31,14 @@ namespace Bots.BGBuddy
         private WoWPoint _lastTargetLocation;
         private ulong _lastTargetGuid;
 
+        // The side that picked StartingLocation at LoadProfile time. When the BG team
+        // index is still unknown at load, Side() falls back to race — which is wrong
+        // for cross-faction placement — so the start location may have been picked
+        // from the wrong profile half. Corrected once the team resolves (see
+        // FixStaleStartLocation).
+        private BattlegroundSide _profileLoadedSide;
+        private bool _startLocationTeamVerified;
+
         // Timer for RandomizeLocation attempts
         private readonly WaitTimer _randomizeTimer = new WaitTimer(TimeSpan.FromSeconds(1));
 
@@ -301,6 +309,12 @@ namespace Bots.BGBuddy
             StartingLocation = Profile.StartLocations.ContainsKey(Side)
                 ? Profile.StartLocations[Side]
                 : WoWPoint.Zero;
+
+            // Remember which half fed StartingLocation and re-arm the late correction:
+            // if the team was still unknown here (WaitForTeam timed out) the side came
+            // from the race fallback and may need fixing once the resolver catches up.
+            _profileLoadedSide = Side;
+            _startLocationTeamVerified = BattlegroundTeams.IsKnown;
         }
 
         /// <summary>
@@ -383,6 +397,41 @@ namespace Bots.BGBuddy
         }
 
         /// <summary>
+        /// Runs once per battleground (and again after each LoadProfile) once the BG
+        /// team index becomes known: re-derives StartingLocation when the side that
+        /// originally picked it disagrees with the real team. Without this, a team
+        /// that resolves after profile load (bounded Lua budget spent on the loading
+        /// screen) would leave the bot anchored to the wrong profile half — ready to
+        /// navigate across the field to the enemy base for "prep".
+        /// </summary>
+        private void FixStaleStartLocation()
+        {
+            if (_startLocationTeamVerified || !BattlegroundTeams.IsKnown)
+                return;
+
+            _startLocationTeamVerified = true;
+
+            Logging.Write("[BGBuddy] BG team resolved after profile load: {0}", BattlegroundTeams.Describe());
+
+            if (_profileLoadedSide == Side)
+                return;
+
+            Logging.Write("[BGBuddy] Start location was picked with the race fallback — re-deriving for the real team ({0}).", Side);
+            StartingLocation = Profile.StartLocations.ContainsKey(Side)
+                ? Profile.StartLocations[Side]
+                : WoWPoint.Zero;
+        }
+
+        private Composite FixStaleStartLocationBehavior()
+        {
+            return new Action(ctx =>
+            {
+                FixStaleStartLocation();
+                return RunStatus.Failure;
+            });
+        }
+
+        /// <summary>
         /// Main common logic for all battlegrounds: prep phase, rest, buffs, mount, move to start,
         /// then targeting sanity, combat, flag interaction, and landmark processing.
         /// </summary>
@@ -391,6 +440,10 @@ namespace Bots.BGBuddy
             get
             {
                 return new PrioritySelector(
+                    // Corrects a start location whose side was chosen before the BG team
+                    // was known; a no-op failure once the team agrees or is still unknown.
+                    FixStaleStartLocationBehavior(),
+
                     CreateBeforePrepBehavior(),
 
                     // Preparation phase — buff up and move to starting location

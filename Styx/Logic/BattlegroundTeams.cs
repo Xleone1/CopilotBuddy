@@ -39,14 +39,33 @@ namespace Styx.Logic
         /// <summary>How many refreshes we spend trying to validate the per-player field.</summary>
         private const int MaxTrustAttempts = 20;
 
-        /// <summary>How many times we ask the client for our faction before giving up.</summary>
+        /// <summary>
+        /// How many times we ask the client for our faction before giving up.
+        /// The budget is spent with a growing backoff (see
+        /// <see cref="FirstClientQueryDelayMs"/>) so it is not burned in the first
+        /// second after map change, while the client is still on the loading screen
+        /// and Lua cannot answer yet.
+        /// </summary>
         private const int MaxClientQueryAttempts = 10;
+
+        /// <summary>First spacing between client-API attempts (milliseconds); doubles up to the cap.</summary>
+        private const int FirstClientQueryDelayMs = 1000;
+
+        /// <summary>Upper bound for the spacing between client-API attempts (milliseconds).</summary>
+        private const int MaxClientQueryDelayMs = 8000;
 
         private static readonly WaitTimer _retryTimer = new WaitTimer(TimeSpan.FromSeconds(2));
 
         private static int _myTeamIndex = UnknownTeam;
         private static int _clientTeam = UnknownTeam;
         private static int _clientQueryAttempts;
+
+        /// <summary>
+        /// UTC ticks when the next client-API attempt is allowed — paces the
+        /// bounded budget across the loading screen instead of spending it in
+        /// the first unresolved resolve calls after map change.
+        /// </summary>
+        private static long _nextClientQueryUtcTicks;
         private static bool _descriptorTrusted;
         private static int _trustAttempts;
         private static uint _resolvedMapId;
@@ -168,6 +187,7 @@ namespace Styx.Logic
             _myTeamIndex = UnknownTeam;
             _clientTeam = UnknownTeam;
             _clientQueryAttempts = 0;
+            _nextClientQueryUtcTicks = 0;
             _descriptorTrusted = false;
             _trustAttempts = 0;
             _resolvedMapId = 0;
@@ -281,6 +301,7 @@ namespace Styx.Logic
             {
                 _clientTeam = UnknownTeam;
                 _clientQueryAttempts = 0;
+                _nextClientQueryUtcTicks = 0;
                 _descriptorTrusted = false;
                 _trustAttempts = 0;
             }
@@ -289,11 +310,34 @@ namespace Styx.Logic
             _resolved = true;
 
             // Bounded: if the client function does not exist on this core we must not
-            // hammer Lua every retry for the rest of the match.
+            // hammer Lua every retry for the rest of the match. The budget is also
+            // paced with a growing backoff: firing one attempt per resolve call
+            // exhausted it within the first second on a live BG — while the client was
+            // still on the loading screen and Lua could not answer yet — and the
+            // resolver then stayed unknown for the entire match (observed live:
+            // client=unknown for 90+ attempts after the entry timed out).
             if (_clientTeam == UnknownTeam && _clientQueryAttempts < MaxClientQueryAttempts)
             {
-                _clientQueryAttempts++;
-                _clientTeam = QueryClientTeam();
+                long now = DateTime.UtcNow.Ticks;
+                if (now >= _nextClientQueryUtcTicks)
+                {
+                    _clientQueryAttempts++;
+                    _clientTeam = QueryClientTeam();
+
+                    if (_clientTeam != UnknownTeam)
+                    {
+                        Logging.Write("[BGTeam] client API answered after {0} attempt(s): team={1}",
+                            _clientQueryAttempts, _clientTeam == HordeTeam ? "Horde" : "Alliance");
+                        _nextClientQueryUtcTicks = long.MaxValue;
+                    }
+                    else
+                    {
+                        int delayMs = FirstClientQueryDelayMs * (1 << Math.Max(0, _clientQueryAttempts - 1));
+                        if (delayMs > MaxClientQueryDelayMs)
+                            delayMs = MaxClientQueryDelayMs;
+                        _nextClientQueryUtcTicks = now + delayMs * TimeSpan.TicksPerMillisecond;
+                    }
+                }
             }
 
             _myTeamIndex = _clientTeam;
