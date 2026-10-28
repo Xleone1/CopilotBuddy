@@ -245,6 +245,9 @@ namespace Bots.BGBuddy
 
         private void OnMapChangedOrStartStop(EventArgs args)
         {
+            // Drop any cached BG team index from the previous match before deciding sides.
+            BattlegroundTeams.Reset();
+
             if (StyxWoW.Me.CurrentMap.IsBattleground)
             {
                 uint mapId = StyxWoW.Me.MapId;
@@ -260,6 +263,9 @@ namespace Bots.BGBuddy
                 SetTargetingFilters();
                 Logger.Write(BGBuddyResources.Starting + CurrentBattleground.Name);
                 CurrentBattleground.Start();
+
+                // Which team we were actually placed on (differs from race on cross-faction servers).
+                Logger.Write("BG team: " + BattlegroundTeams.Describe());
             }
             else if (CurrentBattleground != null)
             {
@@ -440,13 +446,29 @@ namespace Bots.BGBuddy
 
         #region Win/Loss Tracking
 
+        /// <summary>
+        /// Whether we won the battleground. The winner is a BG team index (0 = Horde,
+        /// 1 = Alliance), so it must be compared against our team index rather than
+        /// against our race — cross-faction placement flips those apart.
+        /// </summary>
         private bool WonOrLost
         {
             get
             {
-                if (Styx.Logic.Battlegrounds.Winner != BattlefieldWinner.Alliance)
-                    return StyxWoW.Me.IsHorde;
-                return StyxWoW.Me.IsAlliance;
+                BattlefieldWinner winner = Styx.Logic.Battlegrounds.Winner;
+
+                // Not a decided Horde/Alliance result (None / NotFinished / unknown value).
+                if (winner != BattlefieldWinner.Horde && winner != BattlefieldWinner.Alliance)
+                    return false;
+
+                int myTeam = BattlegroundTeams.MyTeamIndex;
+                if (myTeam != BattlegroundTeams.UnknownTeam)
+                    return (int)winner == myTeam;
+
+                // Team index unavailable — keep the previous race-based behaviour.
+                return winner == BattlefieldWinner.Alliance
+                    ? StyxWoW.Me.IsAlliance
+                    : StyxWoW.Me.IsHorde;
             }
         }
 

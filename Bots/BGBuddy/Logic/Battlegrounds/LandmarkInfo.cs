@@ -31,19 +31,20 @@ namespace Bots.BGBuddy.Logic.Battlegrounds
         public LandmarkControlType Control { get; set; }
 
         /// <summary>
-        /// Whether this landmark is currently controlled by our faction.
+        /// Whether this landmark is currently controlled by our team.
+        /// Uses the BG team index, not race (cross-faction placement reverses them).
         /// </summary>
         public bool ControlledByUs
         {
             get
             {
-                bool isHorde = StyxWoW.Me.IsHorde;
+                bool weAreHorde = BattlegroundTeams.IsHordeSide;
                 switch (Control)
                 {
                     case LandmarkControlType.AllianceControlled:
-                        return !isHorde;
+                        return !weAreHorde;
                     case LandmarkControlType.HordeControlled:
-                        return isHorde;
+                        return weAreHorde;
                     default:
                         return false;
                 }
@@ -51,19 +52,19 @@ namespace Bots.BGBuddy.Logic.Battlegrounds
         }
 
         /// <summary>
-        /// Whether this landmark is currently controlled by the enemy faction.
+        /// Whether this landmark is currently controlled by the enemy team.
         /// </summary>
         public bool ControlledByEnemy
         {
             get
             {
-                bool isHorde = StyxWoW.Me.IsHorde;
+                bool weAreHorde = BattlegroundTeams.IsHordeSide;
                 switch (Control)
                 {
                     case LandmarkControlType.AllianceControlled:
-                        return isHorde;
+                        return weAreHorde;
                     case LandmarkControlType.HordeControlled:
-                        return !isHorde;
+                        return !weAreHorde;
                     default:
                         return false;
                 }

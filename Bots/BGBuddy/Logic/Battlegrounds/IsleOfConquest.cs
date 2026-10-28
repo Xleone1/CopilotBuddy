@@ -188,7 +188,7 @@ namespace Bots.BGBuddy.Logic.Battlegrounds
         {
             get
             {
-                bool isHorde = StyxWoW.Me.IsHorde;
+                bool isHorde = BattlegroundTeams.IsHordeSide;
                 var destroyedGates = Statuses.Values
                     .Where(lm => lm.Control == LandmarkControlType.Destroyed)
                     .Select(lm => (IsleOfConquestLandmarkType)lm.Type)
@@ -223,7 +223,7 @@ namespace Bots.BGBuddy.Logic.Battlegrounds
             var extents = new System.Numerics.Vector3(MapConsts.TileSize / 2f, MapConsts.TileSize / 2f, 200f);
             var polys = Navigator.TripperNavigator.QueryPolygons(e.MapId, tileCenter, extents, 8192);
 
-            bool isHorde = StyxWoW.Me.IsHorde;
+            bool isHorde = BattlegroundTeams.IsHordeSide;
             bool hasTeleport = StyxWoW.Me.HasAura("Teleport");
             bool startOfGame = !_startOfGameTimer.IsFinished;
             var destroyedGates = Statuses.Values
@@ -293,7 +293,7 @@ namespace Bots.BGBuddy.Logic.Battlegrounds
         private void ReloadGates(string reason)
         {
             Logger.WriteDebug($"Reloading gates. Reason: {reason}");
-            bool isHorde = StyxWoW.Me.IsHorde;
+            bool isHorde = BattlegroundTeams.IsHordeSide;
             bool hasTeleport = StyxWoW.Me.HasAura("Teleport");
             bool startOfGame = !_startOfGameTimer.IsFinished;
             var destroyedGates = Statuses.Values

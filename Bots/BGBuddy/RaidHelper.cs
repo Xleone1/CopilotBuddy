@@ -4,6 +4,7 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 using Styx;
+using Styx.Logic;
 using Styx.WoWInternals;
 using Styx.WoWInternals.WoWObjects;
 using Tripper.Tools.Math;
@@ -57,14 +58,14 @@ namespace Bots.BGBuddy
 
         /// <summary>
         /// Counts enemy players within the given MapBox area.
+        /// Enemy is decided by BG team index, not race: on cross-faction servers a
+        /// Horde character can be an Alliance team-mate (and vice versa).
         /// </summary>
         public static int CountEnemyPlayersInBox(MapBox box)
         {
-            bool isHorde = StyxWoW.Me.IsHorde;
-
             // Get enemy players that are alive
             var enemyPlayers = ObjectManager.GetObjectsOfType<WoWPlayer>(false, false)
-                .Where(p => p.IsHorde != isHorde && p.IsAlive);
+                .Where(p => !BattlegroundTeams.IsOnMyTeam(p) && p.IsAlive);
 
             var positions = enemyPlayers.Select(p => new Vector2(p.X, p.Y));
             return GetCountWithin(box.TopLeft, box.BottomRight, positions);

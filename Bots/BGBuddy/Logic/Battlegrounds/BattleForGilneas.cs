@@ -77,9 +77,9 @@ namespace Bots.BGBuddy.Logic.Battlegrounds
         private Composite BuildAttackLogic()
         {
             return new PrioritySelector(
-                new Decorator(ctx => StyxWoW.Me.IsHorde && AllBasesUncontestedByUs,
+                new Decorator(ctx => BattlegroundTeams.IsHordeSide && AllBasesUncontestedByUs,
                     new TreeSharp.Action(ctx => SetHotspot(BattleForGilneasLandmarkType.Mines.ToString(), BGBuddyResources.StartOfGame))),
-                new Decorator(ctx => StyxWoW.Me.IsAlliance && AllBasesUncontestedByUs,
+                new Decorator(ctx => BattlegroundTeams.IsAllianceSide && AllBasesUncontestedByUs,
                     new TreeSharp.Action(ctx => SetHotspot(BattleForGilneasLandmarkType.Lighthouse.ToString(), BGBuddyResources.StartOfGame))),
                 new Decorator(ctx => ClosestConflicted != null,
                     new TreeSharp.Action(ctx => SetHotspot(((BattleForGilneasLandmarkType)ClosestConflicted.Type).ToString(), BGBuddyResources.Conflicted))),

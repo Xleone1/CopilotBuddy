@@ -1,4 +1,4 @@
-﻿// Source: .hb 4.3.4/Honorbuddy/Honorbuddy/ns23/Class51.cs
+// Source: .hb 4.3.4/Honorbuddy/Honorbuddy/ns23/Class51.cs
 using System;
 using System.Linq;
 using Bots.BGBuddy.Helpers;
@@ -85,14 +85,14 @@ namespace Bots.BGBuddy.Logic.Battlegrounds
         private Composite BuildAttackLogic()
         {
             return new PrioritySelector(
-                new TreeSharp.Decorator(ctx => StyxWoW.Me.IsHorde,
+                new TreeSharp.Decorator(ctx => BattlegroundTeams.IsHordeSide,
                     new TreeSharp.PrioritySelector(
                         new TreeSharp.Decorator(ctx => HasDeadBossNearby(AlteracValleyLandmarkType.StonehearthOutpost, BalindaStonehearthEntry),
                             new TreeSharp.Action(ctx => { Logger.Write(BGBuddyResources.BalindaIsDead); _bossesConsideredDead = false; })),
                         new TreeSharp.Decorator(ctx => HasDeadBossNearby(AlteracValleyLandmarkType.IcebloodGarrison, CaptainGalvandarEntry),
                             new TreeSharp.Action(ctx => { Logger.Write(CommonBehaviorsResources.GalvandarIsDead); _bossesConsideredDead = false; })),
                         new TreeSharp.Action(ctx => SetHotspot(AlteracValleyLandmarkType.StonehearthOutpost.ToString(), false, BGBuddyResources.BalindaStonehearth)))),
-                new TreeSharp.Decorator(ctx => StyxWoW.Me.IsHorde,
+                new TreeSharp.Decorator(ctx => BattlegroundTeams.IsHordeSide,
                     new TreeSharp.PrioritySelector(
                         new TreeSharp.Decorator(ctx => CountDestroyedTowers(AlteracValleyLandmarkType.AllianceTowers) >= 2,
                             new TreeSharp.PrioritySelector(

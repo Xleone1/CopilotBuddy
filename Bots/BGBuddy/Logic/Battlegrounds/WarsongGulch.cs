@@ -70,7 +70,7 @@ namespace Bots.BGBuddy.Logic.Battlegrounds
             => EnemyFlagCarrier != null
                && StyxWoW.Me.IsAlive
                && ObjectManager.GetObjectsOfType<WoWPlayer>(false, false)
-                    .Count(p => p.IsHorde == StyxWoW.Me.IsHorde
+                    .Count(p => BattlegroundTeams.IsOnMyTeam(p)
                              && p.IsAlive
                              && p.Location.DistanceSqr(EnemyFlagCarrier.Location) < 100f) >= 2;
     }

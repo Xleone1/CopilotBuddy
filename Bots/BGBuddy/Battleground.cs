@@ -77,6 +77,8 @@ namespace Bots.BGBuddy
         /// <summary>
         /// Current side in the battleground.
         /// For SotA (map 607), returns Attack/Defend. Otherwise returns Alliance/Horde.
+        /// Uses the player's BG team index, not race — a Horde character can be placed
+        /// on the Alliance team (and vice versa) by cross-faction matchmaking.
         /// </summary>
         public BattlegroundSide Side
         {
@@ -86,7 +88,7 @@ namespace Bots.BGBuddy
                 if (StyxWoW.Me.CurrentMap.MapId == 607)
                     return IsAttacking ? BattlegroundSide.Attack : BattlegroundSide.Defend;
 
-                return StyxWoW.Me.IsHorde ? BattlegroundSide.Horde : BattlegroundSide.Alliance;
+                return BattlegroundTeams.IsHordeSide ? BattlegroundSide.Horde : BattlegroundSide.Alliance;
             }
         }
 
@@ -96,17 +98,19 @@ namespace Bots.BGBuddy
         public bool IsAtHotspot => StyxWoW.Me.Location.DistanceSqr(Hotspot) < 900f;
 
         /// <summary>
-        /// Whether our faction is currently on the attacking side (all nodes are lost).
-        /// Horde: no AllianceControlled(512) nodes. Alliance: no HordeControlled(1024) nodes.
+        /// Whether our team is currently on the attacking side (our own defense POI is gone).
+        /// The HordeDefense/AllianceDefense landmark only exists for the defending team, so
+        /// we are attacking when our team's defense marker is absent. Keyed on team, not race.
         /// </summary>
         protected bool IsAttacking
         {
             get
             {
-                if (StyxWoW.Me.IsHorde)
-                    return !Statuses.Values.Any(lm => lm.Type == 512);
-                else
-                    return !Statuses.Values.Any(lm => lm.Type == 1024);
+                int ourDefenseType = BattlegroundTeams.IsHordeSide
+                    ? (int)StrandOfTheAncientsLandmarkType.HordeDefense
+                    : (int)StrandOfTheAncientsLandmarkType.AllianceDefense;
+
+                return !Statuses.Values.Any(lm => lm.Type == ourDefenseType);
             }
         }
 
@@ -197,11 +201,10 @@ namespace Bots.BGBuddy
         {
             get
             {
-                bool isHorde = StyxWoW.Me.IsHorde;
                 var allPlayers = ObjectManager.GetObjectsOfType<WoWPlayer>();
                 var alivePlayers = allPlayers.Where(p => p.IsAlive);
-                var friendlyPlayers = alivePlayers.Where(p => p.IsHorde == isHorde);
-                var enemyPlayers = alivePlayers.Where(p => p.IsHorde != isHorde);
+                var friendlyPlayers = alivePlayers.Where(p => BattlegroundTeams.IsOnMyTeam(p));
+                var enemyPlayers = alivePlayers.Where(p => BattlegroundTeams.IsEnemy(p));
 
                 WoWPoint result = WoWPoint.Zero;
                 int bestCount = 1;
@@ -233,11 +236,10 @@ namespace Bots.BGBuddy
         {
             get
             {
-                bool isHorde = StyxWoW.Me.IsHorde;
                 WoWPoint result = WoWPoint.Zero;
 
                 var friendlyPlayers = ObjectManager.GetObjectsOfType<WoWPlayer>()
-                    .Where(p => p.IsHorde == isHorde && p.IsAlive);
+                    .Where(p => BattlegroundTeams.IsOnMyTeam(p) && p.IsAlive);
 
                 // Order by cluster size descending, then by distance
                 var ordered = friendlyPlayers
@@ -264,9 +266,8 @@ namespace Bots.BGBuddy
         {
             get
             {
-                bool isHorde = StyxWoW.Me.IsHorde;
                 return ObjectManager.GetObjectsOfType<WoWPlayer>(false, false)
-                    .FirstOrDefault(p => p.IsHorde != isHorde && p.Auras.Keys.Any(k => k.ToLowerInvariant().Contains("flag")));
+                    .FirstOrDefault(p => BattlegroundTeams.IsEnemy(p) && p.Auras.Keys.Any(k => k.ToLowerInvariant().Contains("flag")));
             }
         }
 
@@ -277,9 +278,8 @@ namespace Bots.BGBuddy
         {
             get
             {
-                bool isHorde = StyxWoW.Me.IsHorde;
                 return ObjectManager.GetObjectsOfType<WoWPlayer>(false, false)
-                    .FirstOrDefault(p => p.IsHorde == isHorde && p.Auras.Keys.Any(k => k.ToLowerInvariant().Contains("flag")));
+                    .FirstOrDefault(p => BattlegroundTeams.IsOnMyTeam(p) && p.Auras.Keys.Any(k => k.ToLowerInvariant().Contains("flag")));
             }
         }
 
@@ -292,6 +292,11 @@ namespace Bots.BGBuddy
         /// </summary>
         public void LoadProfile()
         {
+            // Give the server a moment to publish our BG team index, otherwise Side()
+            // can fall back to race and the whole match runs off the wrong profile half
+            // (wrong start location and wrong landmark boxes).
+            BattlegroundTeams.WaitForTeam(TimeSpan.FromSeconds(2.5));
+
             Profile = BgBotProfile.Load(Logging.ApplicationPath + "\\Default Profiles\\BGBuddy\\" + NonLocalizedName + ".xml");
             StartingLocation = Profile.StartLocations.ContainsKey(Side)
                 ? Profile.StartLocations[Side]

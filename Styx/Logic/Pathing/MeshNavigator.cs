@@ -142,7 +142,9 @@ namespace Styx.Logic.Pathing
 			if (me == null)
 				return;
 
-			_factionAreaType = me.IsHorde ? TripperNav.AreaType.Horde : TripperNav.AreaType.Alliance;
+			// BG team index, not race: on cross-faction servers the faction navmesh areas
+			// you may walk through follow team assignment, not the character's race.
+			_factionAreaType = BattlegroundTeams.IsHordeSide ? TripperNav.AreaType.Horde : TripperNav.AreaType.Alliance;
 
 			var pos = new Vector3(me.Location.X, me.Location.Y, me.Location.Z);
 			try

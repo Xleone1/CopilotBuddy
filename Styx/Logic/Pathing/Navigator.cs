@@ -412,8 +412,11 @@ namespace Styx.Logic.Pathing
 					var me = StyxWoW.Me;
 					if (me != null)
 					{
-						_navigator.SetFactionQueryFilter(me.IsHorde);
-						var factionArea = me.IsHorde ? TripperNav.AreaType.Horde : TripperNav.AreaType.Alliance;
+						// BG team index, not race (cross-faction placement).
+						bool hordeSide = BattlegroundTeams.IsHordeSide;
+
+						_navigator.SetFactionQueryFilter(hordeSide);
+						var factionArea = hordeSide ? TripperNav.AreaType.Horde : TripperNav.AreaType.Alliance;
 
 						// Create MeshNavigator and set faction area
 						_meshNavigator = new MeshNavigator();

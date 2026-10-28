@@ -75,11 +75,11 @@ namespace Bots.BGBuddy.Logic.Battlegrounds
         private Composite BuildAttackLogic()
         {
             return new PrioritySelector(
-                // Horde start: rush Farm if every base is uncontested or enemy-held.
-                new Decorator(ctx => StyxWoW.Me.IsHorde && AllBasesUncontestedByUs,
+                // Horde team start: rush Farm if every base is uncontested or enemy-held.
+                new Decorator(ctx => BattlegroundTeams.IsHordeSide && AllBasesUncontestedByUs,
                     new TreeSharp.Action(ctx => SetHotspot(ArathiBasinLandmarkType.Farm.ToString(), BGBuddyResources.StartOfGame))),
-                // Alliance start: rush Stables on the same condition.
-                new Decorator(ctx => StyxWoW.Me.IsAlliance && AllBasesUncontestedByUs,
+                // Alliance team start: rush Stables on the same condition.
+                new Decorator(ctx => BattlegroundTeams.IsAllianceSide && AllBasesUncontestedByUs,
                     new TreeSharp.Action(ctx => SetHotspot(ArathiBasinLandmarkType.Stables.ToString(), BGBuddyResources.StartOfGame))),
                 // A base is currently being fought over.
                 new Decorator(ctx => ClosestConflicted != null,

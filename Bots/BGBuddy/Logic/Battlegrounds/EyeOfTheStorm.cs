@@ -85,11 +85,11 @@ namespace Bots.BGBuddy.Logic.Battlegrounds
         private Composite BuildAttackLogic()
         {
             return new PrioritySelector(
-                // Horde start: rush Blood Elf Tower if every tower is uncontrolled.
-                new Decorator(ctx => StyxWoW.Me.IsHorde && AllBasesUncontrolled,
+                // Horde team start: rush Blood Elf Tower if every tower is uncontrolled.
+                new Decorator(ctx => BattlegroundTeams.IsHordeSide && AllBasesUncontrolled,
                     new TreeSharp.Action(ctx => SetHotspot(EyeOfTheStormLandmarkType.BloodElfTower.ToString(), BGBuddyResources.StartOfGame))),
-                // Alliance start: rush Mage Tower on the same condition.
-                new Decorator(ctx => StyxWoW.Me.IsAlliance && AllBasesUncontrolled,
+                // Alliance team start: rush Mage Tower on the same condition.
+                new Decorator(ctx => BattlegroundTeams.IsAllianceSide && AllBasesUncontrolled,
                     new TreeSharp.Action(ctx => SetHotspot(EyeOfTheStormLandmarkType.MageTower.ToString(), BGBuddyResources.StartOfGame))),
                 // A tower has at least 2 friendlies (or 2 enemies on our tower).
                 new Decorator(ctx => ClosestInBattle != null,
