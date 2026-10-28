@@ -152,21 +152,24 @@ namespace GreenMagic
             eventWaitHandleSecurity.AddAccessRule(new EventWaitHandleAccessRule(new SecurityIdentifier(WellKnownSidType.WorldSid, null), EventWaitHandleRights.Synchronize | EventWaitHandleRights.Modify, AccessControlType.Allow));
             eventWaitHandleSecurity.AddAccessRule(new EventWaitHandleAccessRule(new SecurityIdentifier(WellKnownSidType.LocalSystemSid, null), EventWaitHandleRights.FullControl, AccessControlType.Allow));
             
-            m_InjectionWaitingEventName = "Global\\" + GetRandomString(16);
+            // HB Legion anti-detection: name the injection events in GUID format
+            // ({xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx}) so they blend in with events
+            // created by other applications, instead of a subtly-random ASCII name.
+            m_InjectionWaitingEventName = "Global\\" + GetRandomGuidString();
             System.Diagnostics.Debug.WriteLine($"[ExecutorRand] Creating WaitingEvent: {m_InjectionWaitingEventName}");
             m_InjectionWaitingEvent = EventWaitHandleAcl.Create(false, EventResetMode.AutoReset, m_InjectionWaitingEventName, out flag, eventWaitHandleSecurity);
             if (!flag)
             {
                 throw new Exception("You should never see this message, but the event was opened instead of created!  That's bad!");
             }
-            m_InjectionContinueEventName = "Global\\" + GetRandomString(16);
+            m_InjectionContinueEventName = "Global\\" + GetRandomGuidString();
             System.Diagnostics.Debug.WriteLine($"[ExecutorRand] Creating ContinueEvent: {m_InjectionContinueEventName}");
             m_InjectionContinueEvent = EventWaitHandleAcl.Create(false, EventResetMode.AutoReset, m_InjectionContinueEventName, out flag, eventWaitHandleSecurity);
             if (!flag)
             {
                 throw new Exception("You should never see this message, but the event was opened instead of created!  That's bad!");
             }
-            m_InjectionFinishedEventName = "Global\\" + GetRandomString(16);
+            m_InjectionFinishedEventName = "Global\\" + GetRandomGuidString();
             System.Diagnostics.Debug.WriteLine($"[ExecutorRand] Creating FinishedEvent: {m_InjectionFinishedEventName}");
             m_InjectionFinishedEvent = EventWaitHandleAcl.Create(false, EventResetMode.AutoReset, m_InjectionFinishedEventName, out flag, eventWaitHandleSecurity);
             if (!flag)
@@ -431,7 +434,13 @@ namespace GreenMagic
         private void InitializeDetour()
         {
             if (!IsOpen) throw new Exception("Process is not open for memory manipulation.");
-            int size = m_ClearBytes.Length;
+
+            // HB Legion anti-detection: randomize the allocation size per session
+            // (4096..7680). A fixed set of 4096-byte PAGE_* allocations in the target
+            // is itself a scannable signature.  m_Random is seeded before this runs.
+            int size = m_ClearBytes.Length + m_Random.Next(0, 16) * 256;
+            Debug.WriteLine($"[InitializeDetour] Allocation size: {size}");
+
             if (Memory.GetModule("d3d9.dll") == null)
                 throw new Exception("Executor can only be used on processes that use DirectX9.");
 
@@ -853,14 +862,19 @@ namespace GreenMagic
                     AddLine("mov ebp, esp");
                     AddLine("jmp {0}", m_OrigEndScene + 5);
                 }
-                else if (prolog[0] == 0x6A && prolog.Length >= 7 && prolog[2] == 0xB8)
+                else if (IsWinD3D9Prologue(prolog, out string winVariant))
                 {
-                    // Win8 KB3000850: push imm8; mov eax,imm32 — 7 bytes
-                    Debug.WriteLine("[InjectDetour] Using 7-byte Win8 prologue (6A xx B8 xx xx xx xx)");
-                    AddLine("push {0}", prolog[1]);
-                    uint imm32 = BitConverter.ToUInt32(prolog, 3);
-                    AddLine("mov eax, {0}", imm32);
-                    AddLine("jmp {0}", m_OrigEndScene + 7);
+                    // New D3D9 (Windows 8 / Windows 10), from HB Legion:
+                    //   6A 14 B8 [imm32] E8 [rel32] 8B 75 08   (Win8)
+                    //   6A 14 B8 [imm32] E8 [rel32] 8B 7D 08   (Win10)
+                    // The displaced region is exactly 7 bytes (push imm8 + mov eax,imm32),
+                    // so replay those 7 bytes as literal db's (as HB Legion does) and
+                    // resume at EndScene+7 — the E8 call at offset 7 then executes from
+                    // its original address with its original rel32.
+                    Debug.WriteLine($"[InjectDetour] Using 7-byte Windows {winVariant} prologue (6A 14 B8 ... E8 ... 8B {(winVariant == "Windows 8" ? "75" : "7D")} 08)");
+                    for (int i = 0; i < 7; i++)
+                        AddLine("db 0x{0:X}", prolog[i]);
+                    AddRandomLine(m_Random.Next(2, 5), "jmp {0}", m_OrigEndScene + 7);
                 }
                 else if (prolog[0] == 0xE9)
                 {
@@ -872,22 +886,18 @@ namespace GreenMagic
                 }
                 else
                 {
-                    // Fallback to standard 5-byte prologue
-                    Debug.WriteLine("[InjectDetour] FALLBACK: Using standard 5-byte prologue");
-                    AddLine("mov edi, edi");
-                    AddLine("push ebp");
-                    AddLine("mov ebp, esp");
-                    AddLine("jmp {0}", m_OrigEndScene + 5);
+                    // HB Legion: never guess on an unknown prologue. On Windows 10,
+                    // d3d9 EndScene starts with a 7-byte instruction and an E8 call at
+                    // offset 7 — replaying the XP hot-patch prologue and jumping to +5
+                    // would land mid-call-operand and crash the client. Fail loudly
+                    // with the prologue bytes so they appear in the log.
+                    throw new Exception("Could not setup Executor; unknown func passed to hook: " +
+                        BitConverter.ToString(prolog));
                 }
             }
             else
             {
-                // Fallback
-                Debug.WriteLine("[InjectDetour] FALLBACK: Using standard 5-byte prologue");
-                AddLine("mov edi, edi");
-                AddLine("push ebp");
-                AddLine("mov ebp, esp");
-                AddLine("jmp {0}", m_OrigEndScene + 5);
+                throw new Exception("Could not setup Executor; could not read original EndScene bytes to hook.");
             }
             
             if (!Memory.Asm!.Inject(m_EndSceneDetour))
@@ -963,10 +973,10 @@ namespace GreenMagic
                 AddRandomLine("jz @ReturnFalse");
                 AddRandomLine("mov [{0}], eax", m_InjectionFinishedHandlePtr);
                 AddLine("mov eax, 1");
-                AddLine("retn");
-                AddLine("@ReturnFalse:");
-                AddLine("xor eax, eax");
-                AddLine("retn");
+                AddRandomLine("retn");
+                AddRandomLine("@ReturnFalse:");
+                AddRandomLine("xor eax, eax");
+                AddRandomLine("retn");
                 
                 uint result = Memory.Asm!.InjectAndExecute(eventStub);
                 System.Diagnostics.Debug.WriteLine($"[InjectEventStub] InjectAndExecute returned: {result}");
@@ -997,6 +1007,58 @@ namespace GreenMagic
 
         private string GetRandomString(int length) => GetRandomString(length, length);
         private string GetRandomString() => GetRandomString(64, 64);
+
+        /// <summary>
+        /// HB Legion anti-detection: name injected synchronization events in GUID
+        /// format ({xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx}) so they blend in with
+        /// events created by other applications.
+        /// </summary>
+        private string GetRandomGuidString()
+        {
+            const string hex = "0123456789abcdef";
+            var result = new StringBuilder(38);
+            int[] groupLengths = { 8, 4, 4, 4, 12 };
+            result.Append('{');
+            for (int group = 0; group < groupLengths.Length; group++)
+            {
+                if (group > 0)
+                    result.Append('-');
+                for (int i = 0; i < groupLengths[group]; i++)
+                    result.Append(hex[m_Random.Next(hex.Length)]);
+            }
+            result.Append('}');
+            return result.ToString();
+        }
+
+        /// <summary>
+        /// HB Legion: strict identifier matching for the modern d3d9 EndScene prologue
+        /// (Windows 8 KB3000850 and Windows 10):
+        ///   6A 14 B8 [imm32] E8 [rel32] 8B 75 08   (Windows 8)
+        ///   6A 14 B8 [imm32] E8 [rel32] 8B 7D 08   (Windows 10)
+        /// Validating the full 15 bytes prevents misclassifying an unknown prologue
+        /// that merely starts with 6A xx B8.
+        /// </summary>
+        private static bool IsWinD3D9Prologue(byte[] prolog, out string variant)
+        {
+            variant = "";
+            if (prolog == null || prolog.Length < 15)
+                return false;
+            if (prolog[0] != 0x6A || prolog[1] != 0x14 || prolog[2] != 0xB8 || prolog[7] != 0xE8)
+                return false;
+            if (prolog[12] != 0x8B || prolog[14] != 0x08)
+                return false;
+            if (prolog[13] == 0x75)
+            {
+                variant = "Windows 8";
+                return true;
+            }
+            if (prolog[13] == 0x7D)
+            {
+                variant = "Windows 10";
+                return true;
+            }
+            return false;
+        }
 
         #endregion
 
